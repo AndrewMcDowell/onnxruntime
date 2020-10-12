@@ -1263,6 +1263,8 @@ class Graph {
 
   InitializedTensorSet name_to_initial_tensor_;
 
+  InitializedSparseTensorSet sparse_tensor_names_;
+
 #if !defined(ORT_MINIMAL_BUILD)
 
   IOnnxRuntimeOpSchemaCollectionPtr schema_registry_;

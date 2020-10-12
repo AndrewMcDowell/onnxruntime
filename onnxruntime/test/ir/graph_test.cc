@@ -146,6 +146,35 @@ static void ConstructASimpleAddGraph(GraphProto& g, const char* domain) {
   SetTypeAndShape(output->mutable_type()->mutable_tensor_type(), 1, {3, 4, 5});
 }
 
+// To match a simple Add graph above
+static void ConstructSparseTensor(const std::string& name,
+                                  SparseTensorProto& sparse_proto) {
+  const std::vector<int64_t> shape = {3, 4, 5};
+  std::vector<float> values = {13.f,
+                               17.f,
+                               19.f};
+  auto& m_values = *sparse_proto.mutable_values();
+  m_values.set_name(name);
+  m_values.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  *m_values.mutable_dims()->Add() = static_cast<int64_t>(values.size());
+  std::string& raw_data = *m_values.mutable_raw_data();
+  raw_data.resize(values.size() * sizeof(float));
+  auto dest_span = gsl::make_span<float>(reinterpret_cast<float*>(&raw_data[0]), values.size());
+  std::copy(values.cbegin(), values.cend(), dest_span.begin());
+
+  std::vector<int64_t> indicies = {9, 30, 50}; // Not to exceed 59
+  auto& m_indicies = *sparse_proto.mutable_indices();
+  m_indicies.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT64);
+  *m_indicies.mutable_dims()->Add() = static_cast<int64_t>(indicies.size());
+  auto* m_indicies_data = m_indicies.mutable_int64_data();
+  m_indicies_data->Resize(static_cast<int>(indicies.size()), 0);
+  std::copy(indicies.cbegin(), indicies.cend(), m_indicies_data->begin());
+
+  auto& m_dims = *sparse_proto.mutable_dims();
+  m_dims.Resize(static_cast<int>(shape.size()), 0);
+  std::copy(shape.cbegin(), shape.cend(), m_dims.begin());
+}
+
 TEST_F(GraphTest, SimpleAddWithoutDomain) {
   ModelProto m;
   m.set_ir_version(3);
@@ -1064,6 +1093,39 @@ TEST_F(GraphTest, UnusedInitializerIsIgnored) {
   ASSERT_TRUE(graph.GetAllInitializedTensors().empty());
 }
 
+
+TEST_F(GraphTest, UnusedSparseInitializerIsIgnored) {
+  std::string s1;
+  {
+    Model model("UnusedSparseInitializerIsIgnored", false, *logger_);
+    auto model_proto = model.ToProto();
+    auto* m_graph = model_proto.mutable_graph();
+    ConstructASimpleAddGraph(*m_graph, nullptr);
+    auto* m_sparse_initializer = m_graph->add_sparse_initializer();
+    ConstructSparseTensor("unused_sparse_initializer", *m_sparse_initializer);
+    model_proto.SerializeToString(&s1);
+  }
+
+  ModelProto model_proto_1;
+  const bool result = model_proto_1.ParseFromString(s1);
+  ASSERT_TRUE(result) << "Failed to load model from serialized protobuf";
+  ASSERT_EQ(model_proto_1.graph().initializer_size(), 0);
+  ASSERT_EQ(model_proto_1.graph().sparse_initializer_size(), 1);
+
+  std::shared_ptr<onnxruntime::Model> p_tmp_model;
+  auto x = onnxruntime::Model::Load(model_proto_1, p_tmp_model, nullptr, *logger_);
+  ASSERT_STATUS_OK(x);
+
+  auto& graph2 = p_tmp_model->MainGraph();
+  auto status = graph2.Resolve();
+  EXPECT_TRUE(status.IsOK()) << status.ErrorMessage();
+  // Because the sparse initializer was unused, it was also removed
+  // from initializer as well as from sparse_initializer
+  ASSERT_TRUE(graph2.GetAllInitializedTensors().empty());
+  auto& graph_proto = graph2.ToGraphProto();
+  ASSERT_TRUE(graph_proto.sparse_initializer().empty());
+}
+
 TEST_F(GraphTest, GraphConstruction_CheckIsNotAcyclic) {
   // A cyclic graph
   //                 SouceNode
@@ -1525,6 +1587,56 @@ TEST_F(GraphTest, AddRemoveInitializerHandling) {
   auto num_initializers = graph_proto_from_resolved_graph.initializer_size();
   ASSERT_EQ(num_initializers, 0) << "Expected unused initializers to be removed from proto. "
                                  << num_initializers << " remain.";
+}
+
+TEST_F(GraphTest, SparseInitializerHandling) {
+  const char* const input_initializer_name = "x";
+  Model model("SparseInitializerHandling", false, *logger_);
+  std::string s1;
+  // Create model proto with sparse initializer
+  {
+    auto model_proto = model.ToProto();
+    auto* m_graph = model_proto.mutable_graph();
+    ConstructASimpleAddGraph(*m_graph, nullptr);
+    auto* m_sparse_initializer = m_graph->add_sparse_initializer();
+    ConstructSparseTensor(input_initializer_name, *m_sparse_initializer);
+    model_proto.SerializeToString(&s1);
+  }
+
+  ModelProto model_proto_sparse;
+  const bool result = model_proto_sparse.ParseFromString(s1);
+  ASSERT_TRUE(result) << "Failed to load model from serialized protobuf";
+  {
+    auto& graph_proto = model_proto_sparse.graph();
+    ASSERT_EQ(graph_proto.initializer_size(), 0);
+    ASSERT_EQ(graph_proto.sparse_initializer_size(), 1);
+  }
+
+  std::shared_ptr<onnxruntime::Model> p_tmp_model;
+  auto x = onnxruntime::Model::Load(model_proto_sparse, p_tmp_model, nullptr, *logger_);
+
+  auto& graph2 = p_tmp_model->MainGraph();
+  auto status = graph2.Resolve();
+  EXPECT_TRUE(status.IsOK()) << status.ErrorMessage();
+  // Sparse initializer got converted to dense and appears on the list of initializers
+  ASSERT_EQ(graph2.GetAllInitializedTensors().size(), 1U);
+  ASSERT_EQ(graph2.GetAllInitializedTensors().cbegin()->first.compare(input_initializer_name), 0);
+
+  auto& graph_proto = graph2.ToGraphProto();
+  // Got propagated to initializers list
+  ASSERT_EQ(graph_proto.initializer_size(), 1);
+  ASSERT_EQ(graph_proto.initializer().at(0).name().compare(input_initializer_name), 0);
+  // Got removed from sparse initializer list
+  ASSERT_EQ(graph_proto.sparse_initializer_size(), 0);
+
+  {
+    // Check that Model::ToProto() does not return sparse among the normal initializers
+    // but reconstitutes sparse initializer from dense. Thus, here we have dense initializer list empty
+    // but it appears to be in the sparse.
+    auto model_proto_get = p_tmp_model->ToProto();
+    ASSERT_EQ(model_proto_get.graph().initializer_size(), 0);
+    ASSERT_EQ(model_proto_get.graph().sparse_initializer_size(), 1);
+  }
 }
 
 TEST_F(GraphTest, SetInputsAndSetOutputs_NewInputAndOutput) {
